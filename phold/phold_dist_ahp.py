@@ -316,6 +316,13 @@ class SubGrid(Device):
             if 0 <= nj < args.M and ni < self.row_start:
                 src_idx = port_num(i, j, ni, nj)
                 node = self.nodes[i][j]
+                if args.verbose >= 2:
+                    msg = (
+                        f"External (north) link: {self.name}:node_{i}_{j}."
+                        f"port{src_idx} <-> {self.name}:northBorder[{bidx}]"
+                        f" (delay {args.linkDelay})"
+                    )
+                    log_link(msg, level=2)
                 graph.link(getattr(node, f"port{src_idx}"), nb, args.linkDelay)
         
         # South border sweep
@@ -336,6 +343,13 @@ class SubGrid(Device):
             if 0 <= nj < args.M and ni >= self.row_end:
                 src_idx = port_num(i, j, ni, nj)
                 node = self.nodes[i][j]
+                if args.verbose >= 2:
+                    msg = (
+                        f"External (south) link: {self.name}:node_{i}_{j}."
+                        f"port{src_idx} <-> {self.name}:southBorder[{bidx}]"
+                        f" (delay {args.linkDelay})"
+                    )
+                    log_link(msg, level=2)
                 graph.link(getattr(node, f"port{src_idx}"), sb, args.linkDelay)
 
 
