@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+import time
 
 # Allow importing local ahp_graph if not installed
 sys.path.append(os.environ.get('AHP_PATH', '.'))
@@ -485,23 +486,36 @@ if sum([args.write, args.build, args.draw]) > 1:
 if args.draw:
     raise SystemExit("Error: --draw is not implemented.")
 
+ahp_graph_start = time.time()
 if SST:
     ahp_graph = architecture(num_ranks)
 else:
     ahp_graph = architecture(num_nodes*num_ranks)
+ahp_graph_end = time.time()
+print(f"ahp_graph construction on rank {my_rank} takes {ahp_graph_end - ahp_graph_start:.3f} seconds")
+
+sst_graph_start = time.time()
 sst_graph = SSTGraph(ahp_graph)
+sst_graph_end = time.time()
+print(f"sst_graph construction on rank {my_rank} takes {sst_graph_end - sst_graph_start:.3f} seconds")
 
 
 if SST:
     if args.partitioner.lower() == 'sst' and args.build:
+        build_start = time.time()
         sst_graph.build()
+        build_end = time.time()
+        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds")
     elif args.partitioner.lower() == 'sst' and args.write:
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_sst_part_trial{args.trial}_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
         else:
             sst_graph.write_json('ahp_phold_sst_part_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
     elif args.partitioner.lower() == 'ahp_graph' and args.build:
+        build_start = time.time()
         sst_graph.build(num_ranks)
+        build_end = time.time()
+        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds")
     elif args.partitioner.lower() == 'ahp_graph' and args.write:
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_ahp_part_trial{args.trial}_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
