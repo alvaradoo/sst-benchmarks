@@ -2,6 +2,13 @@ import sys
 import os
 import argparse
 import time
+import resource
+
+
+def get_memory_gb() -> float:
+    """Return current memory usage (RSS) in GB."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+
 
 # Allow importing local ahp_graph if not installed
 sys.path.append(os.environ.get('AHP_PATH', '.'))
@@ -426,13 +433,23 @@ class SubGrid(Device):
 
 
 def architecture(num_boards: int) -> DeviceGraph:
-    """Build a row-partitioned device graph and connect adjacent borders."""
+    """Build a row-partitioned device graph and connect adjacent borders.
+    
+    Optimized to only create SubGrids for [my_rank-1, my_rank, my_rank+1]
+    since cross-partition connections only span immediate neighbors.
+    """
     graph = DeviceGraph()
     subgrids = {}
 
     # Divide rows evenly among boards; last gets remainder.
     rows_per = args.height // num_boards if num_boards > 0 else args.height
-    for i in range(num_boards):
+    
+    # Only create SubGrids for [my_rank-1, my_rank, my_rank+1]
+    # This is sufficient because cross-border links only span adjacent partitions
+    start_idx = max(0, my_rank - 1)
+    end_idx = min(num_boards, my_rank + 2)  # exclusive upper bound
+    
+    for i in range(start_idx, end_idx):
         row_start = i * rows_per
         row_end = (i + 1) * rows_per if i != num_boards - 1 else args.height
         sub = SubGrid(f"SubGrid{i}", row_start, row_end)
@@ -441,8 +458,18 @@ def architecture(num_boards: int) -> DeviceGraph:
         subgrids[i] = sub
 
     # Connect borders between adjacent SubGrids.
-    # Iterate over all possible cross-boundary connections.
-    for i in range(1, num_boards):
+    # Only connect borders relevant to my_rank:
+    # - my_rank with my_rank-1 (if my_rank > 0)
+    # - my_rank with my_rank+1 (if my_rank < num_boards-1)
+    # For 1 rank: no border connections needed
+    # For 2 ranks: rank 0 connects to rank 1, rank 1 connects to rank 0
+    border_start = max(1, my_rank)
+    border_end = min(num_boards, my_rank + 2)
+    
+    for i in range(border_start, border_end):
+        # Only process if both SubGrids exist in our local map
+        if (i - 1) not in subgrids or i not in subgrids:
+            continue
         upper = subgrids[i - 1]
         lower = subgrids[i]
         # For each source row in upper's bottom region that can reach into lower
@@ -492,12 +519,12 @@ if SST:
 else:
     ahp_graph = architecture(num_nodes*num_ranks)
 ahp_graph_end = time.time()
-print(f"ahp_graph construction on rank {my_rank} takes {ahp_graph_end - ahp_graph_start:.3f} seconds")
+print(f"ahp_graph construction on rank {my_rank} takes {ahp_graph_end - ahp_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
 
 sst_graph_start = time.time()
 sst_graph = SSTGraph(ahp_graph)
 sst_graph_end = time.time()
-print(f"sst_graph construction on rank {my_rank} takes {sst_graph_end - sst_graph_start:.3f} seconds")
+print(f"sst_graph construction on rank {my_rank} takes {sst_graph_end - sst_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
 
 
 if SST:
@@ -505,7 +532,7 @@ if SST:
         build_start = time.time()
         sst_graph.build()
         build_end = time.time()
-        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds")
+        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
     elif args.partitioner.lower() == 'sst' and args.write:
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_sst_part_trial{args.trial}_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
@@ -515,7 +542,7 @@ if SST:
         build_start = time.time()
         sst_graph.build(num_ranks)
         build_end = time.time()
-        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds")
+        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
     elif args.partitioner.lower() == 'ahp_graph' and args.write:
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_ahp_part_trial{args.trial}_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
