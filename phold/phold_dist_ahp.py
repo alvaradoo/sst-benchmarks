@@ -125,6 +125,10 @@ parser.add_argument(
     '--trial', type=int, default=-1,
     help='Trial number for output filename. When >= 0, output files become ahp_phold_*_part_trialY_TYPEX.json'
 )
+parser.add_argument(
+    '--architecture', type=str, default='spmd',
+    help='Which architecture function to use: spmd or global (default: spmd)'
+)
 args = parser.parse_args()
 
 
@@ -432,7 +436,7 @@ class SubGrid(Device):
                             graph.link(getattr(node, f"port{src_idx}"), sb, args.linkDelay)
 
 
-def architecture(num_boards: int) -> DeviceGraph:
+def architecture_spmd(num_boards: int) -> DeviceGraph:
     """Build a row-partitioned device graph and connect adjacent borders.
     
     Optimized to only create SubGrids for [my_rank-1, my_rank, my_rank+1]
@@ -503,6 +507,68 @@ def architecture(num_boards: int) -> DeviceGraph:
                         )
 
     return graph
+
+
+def architecture_global(num_boards: int) -> DeviceGraph:
+    """Build a row-partitioned device graph and connect adjacent borders."""
+    graph = DeviceGraph()
+    subgrids = {}
+
+    # Divide rows evenly among boards; last gets remainder.
+    rows_per = args.height // num_boards if num_boards > 0 else args.height
+    for i in range(num_boards):
+        row_start = i * rows_per
+        row_end = (i + 1) * rows_per if i != num_boards - 1 else args.height
+        sub = SubGrid(f"SubGrid{i}", row_start, row_end)
+        sub.set_partition(i)
+        graph.add(sub)
+        subgrids[i] = sub
+
+    # Connect borders between adjacent SubGrids.
+    # Iterate over all possible cross-boundary connections.
+    for i in range(1, num_boards):
+        upper = subgrids[i - 1]
+        lower = subgrids[i]
+        # For each source row in upper's bottom region that can reach into lower
+        for src_row_offset in range(NUM_RINGS):
+            # src_row is (upper.row_end - 1) - src_row_offset
+            # For each target row in lower's top region
+            for tgt_row_offset in range(NUM_RINGS):
+                # tgt_row is lower.row_start + tgt_row_offset
+                # Total vertical distance = src_row_offset + 1 + tgt_row_offset
+                total_di = src_row_offset + 1 + tgt_row_offset
+                if total_di > NUM_RINGS:
+                    continue  # Beyond ring neighborhood
+                for j in range(args.width):
+                    for dj in range(-NUM_RINGS, NUM_RINGS + 1):
+                        if max(total_di, abs(dj)) > NUM_RINGS:
+                            continue
+                        jj = j + dj
+                        if not (0 <= jj < args.width):
+                            continue
+                        bidx = border_index(j, dj, src_row_offset, tgt_row_offset)
+                        if args.verbose >= 2:
+                            msg = (
+                                f"Inter-subgrid link: {upper.name}.southBorder[{bidx}] "
+                                f"<-> {lower.name}.northBorder[{bidx}] (delay {args.linkDelay})"
+                            )
+                            log_link(msg, level=2)
+                        graph.link(
+                            upper.southBorder(bidx),
+                            lower.northBorder(bidx), 
+                            args.linkDelay
+                        )
+
+    return graph
+
+
+def architecture(num_boards: int) -> DeviceGraph:
+    """Dispatch to the selected architecture function."""
+    if args.architecture.lower() == 'global':
+        return architecture_global(num_boards)
+    else:
+        return architecture_spmd(num_boards)
+
 
 if not (args.write or args.build or args.draw):
     args.build = True
