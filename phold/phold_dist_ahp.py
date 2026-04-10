@@ -141,6 +141,17 @@ else:
     num_ranks = args.numRanks
     num_nodes = args.numNodes
 
+
+def trace(msg: str, level: int = 1) -> None:
+    """Print benchmark execution trace controlled by --verbose."""
+    if args.verbose >= level:
+        print(f"[AHP][rank={my_rank}][phold_dist_ahp] {msg}")
+
+
+# Export trace settings so ahp_graph internals can emit coordinated logs.
+os.environ['AHP_TRACE_VERBOSE'] = str(args.verbose)
+os.environ['AHP_TRACE_RANK'] = str(my_rank)
+
 # We divide number of ranks by number of nodes to get the number of ranks per node in the filename as that is how the submission scripts expect it.
 if SST:
     output_dir = f"output/height-{args.height}_width-{args.width}_numRings-{args.numRings}_numNodes-{num_nodes}_numRanks-{int(num_ranks/num_nodes)}"
@@ -166,6 +177,12 @@ def log_init(my_rank: int, num_ranks: int, num_threads: int) -> None:
 
 if SST:
     log_init(my_rank, num_ranks, sst.getThreadCount())
+
+trace(
+    f"startup SST={SST} partitioner={args.partitioner} architecture={args.architecture} "
+    f"height={args.height} width={args.width} rings={args.numRings}",
+    level=1,
+)
 
 
 def log_link(msg: str, level: int = 1) -> None:
@@ -240,6 +257,7 @@ class Node(Device):
         Ports follow the ring neighborhood up to `NUM_RINGS`, including self.
         """
         super().__init__(name)
+        trace(f"Node.__init__ name={name} row={i} col={j}", level=3)
         self.type = None
         self.portinfo = PortInfo()
         
@@ -292,6 +310,10 @@ class SubGrid(Device):
         self.row_start = row_start
         self.row_end = row_end
         self.nodes = {}
+        trace(
+            f"SubGrid.__init__ name={name} row_start={row_start} row_end={row_end}",
+            level=2,
+        )
     
     def expand(self, graph: DeviceGraph) -> None:
         """Construct child nodes and wire internal and border links.
@@ -299,6 +321,10 @@ class SubGrid(Device):
         Internal links use a duplicate-avoid rule; border links are anchored
         via single representative connections per multi-port index.
         """
+        trace(
+            f"SubGrid.expand start name={self.name} rows=[{self.row_start},{self.row_end})",
+            level=1,
+        )
         self.nodes = {}
         for i in range(self.row_start, self.row_end):
             self.nodes[i] = {}
@@ -343,13 +369,13 @@ class SubGrid(Device):
                                 if not (di < 0 or (di == 0 and dj < 0)):
                                     continue
 
-                            if args.verbose >= 2:
-                                msg = (
-                                    f"Internal link: {self.name}.comp_{i}_{j}."
-                                    f"{src_port} <-> {self.name}.comp_{ni}_{nj}."
-                                    f"{tgt_port} (delay {args.linkDelay})"
-                                )
-                                log_link(msg, level=2)
+                            # if args.verbose >= 2:
+                            #     msg = (
+                            #         f"Internal link: {self.name}.comp_{i}_{j}."
+                            #         f"{src_port} <-> {self.name}.comp_{ni}_{nj}."
+                            #         f"{tgt_port} (delay {args.linkDelay})"
+                            #     )
+                            #     log_link(msg, level=2)
 
                             src_node = self.nodes[i][j]
                             tgt_node = self.nodes[ni][nj]
@@ -397,12 +423,12 @@ class SubGrid(Device):
                             nb = self.northBorder(bidx)
                             src_idx = port_num(i, j, ni, nj)
                             node = self.nodes[i][j]
-                            if args.verbose >= 2:
-                                msg = (
-                                    f"Border link (north): {self.name}.comp_{i}_{j}.port{src_idx} "
-                                    f"-> {self.name}.northBorder[{bidx}] (delay {args.linkDelay})"
-                                )
-                                log_link(msg, level=2)
+                            # if args.verbose >= 2:
+                            #     msg = (
+                            #         f"Border link (north): {self.name}.comp_{i}_{j}.port{src_idx} "
+                            #         f"-> {self.name}.northBorder[{bidx}] (delay {args.linkDelay})"
+                            #     )
+                            #     log_link(msg, level=2)
                             graph.link(getattr(node, f"port{src_idx}"), nb, args.linkDelay)
         
         # South border sweep
@@ -427,13 +453,18 @@ class SubGrid(Device):
                             sb = self.southBorder(bidx)
                             src_idx = port_num(i, j, ni, nj)
                             node = self.nodes[i][j]
-                            if args.verbose >= 2:
-                                msg = (
-                                    f"Border link (south): {self.name}.comp_{i}_{j}.port{src_idx} "
-                                    f"-> {self.name}.southBorder[{bidx}] (delay {args.linkDelay})"
-                                )
-                                log_link(msg, level=2)
+                            # if args.verbose >= 2:
+                            #     msg = (
+                            #         f"Border link (south): {self.name}.comp_{i}_{j}.port{src_idx} "
+                            #         f"-> {self.name}.southBorder[{bidx}] (delay {args.linkDelay})"
+                            #     )
+                            #     log_link(msg, level=2)
                             graph.link(getattr(node, f"port{src_idx}"), sb, args.linkDelay)
+
+        trace(
+            f"SubGrid.expand complete name={self.name} nodes={len(self.nodes)}",
+            level=1,
+        )
 
 
 def architecture_spmd(num_boards: int) -> DeviceGraph:
@@ -442,6 +473,10 @@ def architecture_spmd(num_boards: int) -> DeviceGraph:
     Optimized to only create SubGrids for [my_rank-1, my_rank, my_rank+1]
     since cross-partition connections only span immediate neighbors.
     """
+    trace(
+        f"architecture_spmd start num_boards={num_boards} my_rank={my_rank}",
+        level=1,
+    )
     graph = DeviceGraph()
     subgrids = {}
 
@@ -494,23 +529,32 @@ def architecture_spmd(num_boards: int) -> DeviceGraph:
                         if not (0 <= jj < args.width):
                             continue
                         bidx = border_index(j, dj, src_row_offset, tgt_row_offset)
-                        if args.verbose >= 2:
-                            msg = (
-                                f"Inter-subgrid link: {upper.name}.southBorder[{bidx}] "
-                                f"<-> {lower.name}.northBorder[{bidx}] (delay {args.linkDelay})"
-                            )
-                            log_link(msg, level=2)
+                        # if args.verbose >= 2:
+                        #     msg = (
+                        #         f"Inter-subgrid link: {upper.name}.southBorder[{bidx}] "
+                        #         f"<-> {lower.name}.northBorder[{bidx}] (delay {args.linkDelay})"
+                        #     )
+                        #     log_link(msg, level=2)
                         graph.link(
                             upper.southBorder(bidx),
                             lower.northBorder(bidx), 
                             args.linkDelay
                         )
 
+    trace(
+        f"architecture_spmd complete subgrids={len(subgrids)} links={len(graph.links)}",
+        level=1,
+    )
+
     return graph
 
 
 def architecture_global(num_boards: int) -> DeviceGraph:
     """Build a row-partitioned device graph and connect adjacent borders."""
+    trace(
+        f"architecture_global start num_boards={num_boards} my_rank={my_rank}",
+        level=1,
+    )
     graph = DeviceGraph()
     subgrids = {}
 
@@ -547,23 +591,29 @@ def architecture_global(num_boards: int) -> DeviceGraph:
                         if not (0 <= jj < args.width):
                             continue
                         bidx = border_index(j, dj, src_row_offset, tgt_row_offset)
-                        if args.verbose >= 2:
-                            msg = (
-                                f"Inter-subgrid link: {upper.name}.southBorder[{bidx}] "
-                                f"<-> {lower.name}.northBorder[{bidx}] (delay {args.linkDelay})"
-                            )
-                            log_link(msg, level=2)
+                        # if args.verbose >= 2:
+                        #     msg = (
+                        #         f"Inter-subgrid link: {upper.name}.southBorder[{bidx}] "
+                        #         f"<-> {lower.name}.northBorder[{bidx}] (delay {args.linkDelay})"
+                        #     )
+                        #     log_link(msg, level=2)
                         graph.link(
                             upper.southBorder(bidx),
                             lower.northBorder(bidx), 
                             args.linkDelay
                         )
 
+    trace(
+        f"architecture_global complete subgrids={len(subgrids)} links={len(graph.links)}",
+        level=1,
+    )
+
     return graph
 
 
 def architecture(num_boards: int) -> DeviceGraph:
     """Dispatch to the selected architecture function."""
+    trace(f"architecture dispatch mode={args.architecture} boards={num_boards}", level=1)
     if args.architecture.lower() == 'global':
         return architecture_global(num_boards)
     else:
@@ -579,37 +629,43 @@ if sum([args.write, args.build, args.draw]) > 1:
 if args.draw:
     raise SystemExit("Error: --draw is not implemented.")
 
+trace("starting AHP graph construction", level=1)
 ahp_graph_start = time.time()
 if SST:
     ahp_graph = architecture(num_ranks)
 else:
     ahp_graph = architecture(num_nodes*num_ranks)
 ahp_graph_end = time.time()
-print(f"ahp_graph construction on rank {my_rank} takes {ahp_graph_end - ahp_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
+# print(f"ahp_graph construction on rank {my_rank} takes {ahp_graph_end - ahp_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
 
+trace("starting SSTGraph wrapper construction", level=1)
 sst_graph_start = time.time()
 sst_graph = SSTGraph(ahp_graph)
 sst_graph_end = time.time()
-print(f"sst_graph construction on rank {my_rank} takes {sst_graph_end - sst_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
+# print(f"sst_graph construction on rank {my_rank} takes {sst_graph_end - sst_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
 
 
 if SST:
     if args.partitioner.lower() == 'sst' and args.build:
+        trace("executing sst_graph.build() with SST partitioner", level=1)
         build_start = time.time()
         sst_graph.build()
         build_end = time.time()
-        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
+        # print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
     elif args.partitioner.lower() == 'sst' and args.write:
+        trace("executing sst_graph.write_json() with SST partitioner", level=1)
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_sst_part_trial{args.trial}_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
         else:
             sst_graph.write_json('ahp_phold_sst_part_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
     elif args.partitioner.lower() == 'ahp_graph' and args.build:
+        trace(f"executing sst_graph.build(nranks={num_ranks}) with ahp_graph partitioner", level=1)
         build_start = time.time()
         sst_graph.build(num_ranks)
         build_end = time.time()
-        print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
+        # print(f"sst_graph build call on rank {my_rank} takes {build_end - build_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
     elif args.partitioner.lower() == 'ahp_graph' and args.write:
+        trace("executing sst_graph.write_json() with ahp_graph partitioner", level=1)
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_ahp_part_trial{args.trial}_mpi.json', output=output_dir, nranks=num_ranks, rank=my_rank)
         else:
@@ -619,11 +675,13 @@ if SST:
 else:
     total_ranks = num_nodes * num_ranks
     if args.partitioner.lower() == 'sst' and args.write:
+        trace("executing python-mode sst partitioner write_json", level=1)
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_sst_part_trial{args.trial}_python.json', output=output_dir, nranks=total_ranks, rank=my_rank)
         else:
             sst_graph.write_json('ahp_phold_sst_part_python.json', output=output_dir, nranks=total_ranks, rank=my_rank)
     elif args.partitioner.lower() == 'ahp_graph' and args.write:
+        trace("executing python-mode ahp_graph partitioner write_json", level=1)
         if args.trial >= 0:
             sst_graph.write_json(f'ahp_phold_ahp_part_trial{args.trial}_python.json', output=output_dir, nranks=total_ranks, rank=my_rank)
         else:
