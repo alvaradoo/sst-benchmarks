@@ -383,6 +383,7 @@ class SubGrid(Device):
                                 getattr(src_node, src_port),
                                 getattr(tgt_node, tgt_port),
                                 args.linkDelay,
+                                my_rank = my_rank
                             )
                         # Neighbor outside this subgrid: handled by border sweeps.
                         elif 0 <= ni < args.height:
@@ -429,7 +430,7 @@ class SubGrid(Device):
                             #         f"-> {self.name}.northBorder[{bidx}] (delay {args.linkDelay})"
                             #     )
                             #     log_link(msg, level=2)
-                            graph.link(getattr(node, f"port{src_idx}"), nb, args.linkDelay)
+                            graph.link(getattr(node, f"port{src_idx}"), nb, args.linkDelay, my_rank = my_rank)
         
         # South border sweep
         # Connect to neighbors below this subgrid
@@ -459,7 +460,7 @@ class SubGrid(Device):
                             #         f"-> {self.name}.southBorder[{bidx}] (delay {args.linkDelay})"
                             #     )
                             #     log_link(msg, level=2)
-                            graph.link(getattr(node, f"port{src_idx}"), sb, args.linkDelay)
+                            graph.link(getattr(node, f"port{src_idx}"), sb, args.linkDelay, my_rank = my_rank)
 
         trace(
             f"SubGrid.expand complete name={self.name} nodes={len(self.nodes)}",
@@ -538,7 +539,8 @@ def architecture_spmd(num_boards: int) -> DeviceGraph:
                         graph.link(
                             upper.southBorder(bidx),
                             lower.northBorder(bidx), 
-                            args.linkDelay
+                            args.linkDelay,
+                            my_rank = my_rank
                         )
 
     trace(
@@ -599,8 +601,9 @@ def architecture_global(num_boards: int) -> DeviceGraph:
                         #     log_link(msg, level=2)
                         graph.link(
                             upper.southBorder(bidx),
-                            lower.northBorder(bidx), 
-                            args.linkDelay
+                            lower.northBorder(bidx),
+                            args.linkDelay,
+                            my_rank = my_rank
                         )
 
     trace(
