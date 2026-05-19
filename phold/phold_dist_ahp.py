@@ -127,7 +127,7 @@ parser.add_argument(
 )
 parser.add_argument(
     '--architecture', type=str, default='spmd',
-    help='Which architecture function to use: spmd or global (default: spmd)'
+    help='Which architecture function to use: spmd, global, or global_opt (default: spmd)'
 )
 args = parser.parse_args()
 
@@ -435,6 +435,166 @@ class SubGrid(Device):
                                 log_link(msg, level=2)
                             graph.link(getattr(node, f"port{src_idx}"), sb, args.linkDelay)
 
+class SubGridOpt(Device):
+    """Row-partitioned assembly; wires internal links and border anchors."""
+
+    # Expose indexed north/south border multi-ports sized for all columns and
+    # all offsets within the ring neighborhood.
+    # Size: width * NUM_RINGS * NUM_RINGS * SIDE (for src_row_offset, tgt_row_offset, dj)
+    portinfo = PortInfo()
+    portinfo.add('northBorder', 'String', limit=args.width*NUM_RINGS*NUM_RINGS*SIDE, required=False)
+    portinfo.add('southBorder', 'String', limit=args.width*NUM_RINGS*NUM_RINGS*SIDE, required=False)
+
+    def __init__(self, name, row_start, row_end):
+        """Initialize subgrid covering rows [row_start, row_end)."""
+        super().__init__(name)
+        self.row_start = row_start
+        self.row_end = row_end
+        self.nodes = {}
+    
+    def expand(self, graph: DeviceGraph) -> None:
+        """Construct child nodes and wire internal and border links.
+
+        Internal links use a duplicate-avoid rule; border links are anchored
+        via single representative connections per multi-port index.
+        """
+        self.nodes = {}
+        for i in range(self.row_start, self.row_end):
+            self.nodes[i] = {}
+            for j in range(args.width):
+                n = Node(f"comp_{i}_{j}", i, j)
+                # Ensure child nodes inherit the SubGrid's partition (rank, thread)
+                if getattr(self, 'partition', None) is not None:
+                    n.set_partition(self.partition[0], self.partition[1])
+                self.nodes[i][j] = n
+
+        M = args.width
+    
+        # Defer border wiring to sweeps to avoid multi-link collisions.
+        for i in range(self.row_start, self.row_end):
+            for j in range(M):
+                for di in range(-NUM_RINGS, NUM_RINGS + 1):
+                    for dj in range(-NUM_RINGS, NUM_RINGS + 1):
+                        # Enforce ring boundary.
+                        if max(abs(di), abs(dj)) > NUM_RINGS:
+                            continue
+
+                        ni = i + di
+                        nj = j + dj
+
+                        # Only consider in-bounds neighbors in global grid
+                        if not (0 <= ni < args.height and 0 <= nj < M):
+                            continue
+
+                        src_idx = port_num(i, j, ni, nj)
+                        tgt_idx = port_num(ni, nj, i, j)
+                        src_port = f"port{src_idx}"
+                        tgt_port = f"port{tgt_idx}"
+
+                        # Internal neighbor within this subgrid
+                        if self.row_start <= ni < self.row_end:
+                            # Self-link handling: include unless disabled
+                            if di == 0 and dj == 0:
+                                if args.no_self_links:
+                                    continue
+                            else:
+                                # Duplicate-avoid rule for non-self internal wiring
+                                if not (di < 0 or (di == 0 and dj < 0)):
+                                    continue
+
+                            if args.verbose >= 2:
+                                msg = (
+                                    f"Internal link: {self.name}.comp_{i}_{j}."
+                                    f"{src_port} <-> {self.name}.comp_{ni}_{nj}."
+                                    f"{tgt_port} (delay {args.linkDelay})"
+                                )
+                                log_link(msg, level=2)
+
+                            src_node = self.nodes[i][j]
+                            tgt_node = self.nodes[ni][nj]
+                            graph.link_opt(
+                                getattr(src_node, src_port),
+                                getattr(tgt_node, tgt_port),
+                                my_rank,
+                                args.linkDelay,
+                            )
+                        # Neighbor outside this subgrid: handled by border sweeps.
+                        elif 0 <= ni < args.height:
+                            continue
+
+        # Single-link border sweeps: one anchor per border index.
+        tops = list(range(self.row_start, min(self.row_start + NUM_RINGS, self.row_end)))
+        bots = list(range(max(self.row_start, self.row_end - NUM_RINGS), self.row_end))
+        
+        # North border sweep
+        # Connect to neighbors above this subgrid
+        # From this subgrid's perspective: source at (i,j), target at (ni,nj) = (i+di, j+dj) where di<0
+        # Must compute bidx to match what upper subgrid's south sweep computed:
+        #   upper's source was at (ni, nj), upper's target was at (i, j)
+        #   upper's src_row_offset = (upper.row_end - 1) - ni
+        #   upper's tgt_row_offset = i - upper.row_end
+        #   upper's bidx = border_index(nj, -dj, src_row_offset, tgt_row_offset)
+        for top in tops:
+            i = top
+            for j in range(args.width):
+                for di in range(-NUM_RINGS, 0):  # Only negative di (going up)
+                    for dj in range(-NUM_RINGS, NUM_RINGS + 1):
+                        if max(abs(di), abs(dj)) > NUM_RINGS:
+                            continue
+                        ni = i + di
+                        nj = j + dj
+                        # Only create border link if neighbor is above this subgrid
+                        if ni < self.row_start and 0 <= nj < args.width and 0 <= ni:
+                            # Compute bidx from upper subgrid's south perspective:
+                            # upper.row_end = self.row_start
+                            upper_row_end = self.row_start
+                            # upper's source was at row ni, column nj
+                            src_row_offset = (upper_row_end - 1) - ni
+                            # upper's target (this comp) is at row i
+                            tgt_row_offset = i - upper_row_end
+                            # upper used column nj and dj' = j - nj = -dj
+                            bidx = border_index(nj, -dj, src_row_offset, tgt_row_offset)
+                            nb = self.northBorder(bidx)
+                            src_idx = port_num(i, j, ni, nj)
+                            node = self.nodes[i][j]
+                            if args.verbose >= 2:
+                                msg = (
+                                    f"Border link (north): {self.name}.comp_{i}_{j}.port{src_idx} "
+                                    f"-> {self.name}.northBorder[{bidx}] (delay {args.linkDelay})"
+                                )
+                                log_link(msg, level=2)
+                            graph.link_opt(getattr(node, f"port{src_idx}"), nb, my_rank, args.linkDelay)
+        
+        # South border sweep
+        # Connect to neighbors below this subgrid
+        # source is comp at (i,j), target is at (i+di, j+dj) where di>0
+        for bot in bots:
+            i = bot
+            for j in range(args.width):
+                for di in range(1, NUM_RINGS + 1):  # Only positive di (going down)
+                    for dj in range(-NUM_RINGS, NUM_RINGS + 1):
+                        if max(di, abs(dj)) > NUM_RINGS:
+                            continue
+                        ni = i + di
+                        nj = j + dj
+                        # Only create border link if neighbor is below this subgrid
+                        if ni >= self.row_end and 0 <= nj < args.width and ni < args.height:
+                            # src_row_offset: how far source is from bottom boundary
+                            src_row_offset = (self.row_end - 1) - i
+                            # tgt_row_offset: how far target is past the boundary  
+                            tgt_row_offset = ni - self.row_end
+                            bidx = border_index(j, dj, src_row_offset, tgt_row_offset)
+                            sb = self.southBorder(bidx)
+                            src_idx = port_num(i, j, ni, nj)
+                            node = self.nodes[i][j]
+                            if args.verbose >= 2:
+                                msg = (
+                                    f"Border link (south): {self.name}.comp_{i}_{j}.port{src_idx} "
+                                    f"-> {self.name}.southBorder[{bidx}] (delay {args.linkDelay})"
+                                )
+                                log_link(msg, level=2)
+                            graph.link_opt(getattr(node, f"port{src_idx}"), sb, my_rank, args.linkDelay)
+
 
 def architecture_spmd(num_boards: int) -> DeviceGraph:
     """Build a row-partitioned device graph and connect adjacent borders.
@@ -561,11 +721,66 @@ def architecture_global(num_boards: int) -> DeviceGraph:
 
     return graph
 
+def architecture_global_opt(num_boards: int) -> DeviceGraph:
+    """Build a row-partitioned device graph and connect adjacent borders."""
+    graph = DeviceGraph()
+    subgrids = {}
+
+    # Divide rows evenly among boards; last gets remainder.
+    rows_per = args.height // num_boards if num_boards > 0 else args.height
+    for i in range(num_boards):
+        row_start = i * rows_per
+        row_end = (i + 1) * rows_per if i != num_boards - 1 else args.height
+        sub = SubGridOpt(f"SubGridOpt{i}", row_start, row_end)
+        sub.set_partition(i)
+        graph.add(sub)
+        subgrids[i] = sub
+
+    # Connect borders between adjacent SubGrids.
+    # Iterate over all possible cross-boundary connections.
+    for i in range(1, num_boards):
+        upper = subgrids[i - 1]
+        lower = subgrids[i]
+        # For each source row in upper's bottom region that can reach into lower
+        for src_row_offset in range(NUM_RINGS):
+            # src_row is (upper.row_end - 1) - src_row_offset
+            # For each target row in lower's top region
+            for tgt_row_offset in range(NUM_RINGS):
+                # tgt_row is lower.row_start + tgt_row_offset
+                # Total vertical distance = src_row_offset + 1 + tgt_row_offset
+                total_di = src_row_offset + 1 + tgt_row_offset
+                if total_di > NUM_RINGS:
+                    continue  # Beyond ring neighborhood
+                for j in range(args.width):
+                    for dj in range(-NUM_RINGS, NUM_RINGS + 1):
+                        if max(total_di, abs(dj)) > NUM_RINGS:
+                            continue
+                        jj = j + dj
+                        if not (0 <= jj < args.width):
+                            continue
+                        bidx = border_index(j, dj, src_row_offset, tgt_row_offset)
+                        if args.verbose >= 2:
+                            msg = (
+                                f"Inter-subgrid link: {upper.name}.southBorder[{bidx}] "
+                                f"<-> {lower.name}.northBorder[{bidx}] (delay {args.linkDelay})"
+                            )
+                            log_link(msg, level=2)
+                        graph.link_opt(
+                            upper.southBorder(bidx),
+                            lower.northBorder(bidx),
+                            my_rank,
+                            args.linkDelay
+                        )
+
+    return graph
+
 
 def architecture(num_boards: int) -> DeviceGraph:
     """Dispatch to the selected architecture function."""
     if args.architecture.lower() == 'global':
         return architecture_global(num_boards)
+    elif args.architecture.lower() == 'global_opt':
+        return architecture_global_opt(num_boards)
     else:
         return architecture_spmd(num_boards)
 
@@ -586,6 +801,7 @@ else:
     ahp_graph = architecture(num_nodes*num_ranks)
 ahp_graph_end = time.time()
 print(f"ahp_graph construction on rank {my_rank} takes {ahp_graph_end - ahp_graph_start:.3f} seconds, memory: {get_memory_gb():.2f} GB")
+print(f"ahp_graph on rank {my_rank} has {len(ahp_graph.links)} links")
 
 sst_graph_start = time.time()
 sst_graph = SSTGraph(ahp_graph)

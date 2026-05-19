@@ -11,6 +11,9 @@ import re
 from typing import Dict, Tuple, List, Optional
 
 
+SUPPORTED_ARCHITECTURES = ["spmd", "global", "global_opt"]
+
+
 def parse_recv_counts(output: str) -> Dict[Tuple[int, int], int]:
     """Parse recvCount values from simulation output.
     
@@ -500,8 +503,11 @@ def main():
     )
     parser.add_argument(
         "--architecture", type=str, default="spmd",
-        choices=["spmd", "global"],
-        help="Which architecture function to use in phold_dist_ahp.py (default: spmd)"
+        choices=SUPPORTED_ARCHITECTURES + ["all"],
+        help=(
+            "Which architecture function to use in phold_dist_ahp.py "
+            "(spmd, global, global_opt, or all; default: spmd)"
+        )
     )
     args = parser.parse_args()
     
@@ -516,7 +522,17 @@ def main():
         return 0
     
     if args.inspect:
-        return run_inspect_mode(tests, args.test, architecture=args.architecture)
+        architectures = (
+            SUPPORTED_ARCHITECTURES if args.architecture == "all"
+            else [args.architecture]
+        )
+        inspect_rc = 0
+        for arch in architectures:
+            print(f"\nRunning inspect mode with architecture='{arch}'")
+            rc = run_inspect_mode(tests, args.test, architecture=arch)
+            if rc != 0:
+                inspect_rc = 1
+        return inspect_rc
     
     if args.test:
         tests = [t for t in tests if t.name == args.test]
@@ -528,25 +544,33 @@ def main():
     failed = 0
     skipped = 0
     results = []
+
+    architectures = (
+        SUPPORTED_ARCHITECTURES if args.architecture == "all"
+        else [args.architecture]
+    )
     
-    for test in tests:
-        success, msg = run_test(test, verbose=not args.quiet,
-                                architecture=args.architecture)
-        
-        if "SKIP" in msg:
-            skipped += 1
-            status = "SKIP"
-        elif success:
-            passed += 1
-            status = "PASS"
-        else:
-            failed += 1
-            status = "FAIL"
-        
-        results.append((test.name, status, msg))
-        
+    for arch in architectures:
         if not args.quiet:
-            print(f"\n{status}: {msg}")
+            print(f"\nTesting architecture='{arch}'")
+        for test in tests:
+            success, msg = run_test(test, verbose=not args.quiet,
+                                    architecture=arch)
+
+            if "SKIP" in msg:
+                skipped += 1
+                status = "SKIP"
+            elif success:
+                passed += 1
+                status = "PASS"
+            else:
+                failed += 1
+                status = "FAIL"
+
+            results.append((f"{test.name} [{arch}]", status, msg))
+
+            if not args.quiet:
+                print(f"\n{status}: {msg}")
     
     # Summary
     print(f"\n{'='*60}")
